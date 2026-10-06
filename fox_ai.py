@@ -20,8 +20,8 @@ CLOUDFLARE_ENV_FILE = CONFIG_DIR / "cloudflare.env"
 BACKUP_DIR = Path(".fox-ai") / "backups"
 
 # Verified against Cloudflare's official model catalog on 2026-10-06:
-# https://developers.cloudflare.com/workers-ai/models/glm-5.3/
-CLOUDFLARE_MODEL = "@cf/zai-org/glm-5.3"
+# https://developers.cloudflare.com/workers-ai/models/glm-4.7-flash/
+CLOUDFLARE_MODEL = "@cf/zai-org/glm-4.7-flash"
 # Official OpenAI-compatible endpoint documentation:
 # https://developers.cloudflare.com/workers-ai/configuration/open-ai-compatibility/
 CLOUDFLARE_API_ROOT = "https://api.cloudflare.com/client/v4/accounts"
