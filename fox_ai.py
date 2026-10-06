@@ -5,10 +5,11 @@ import sys
 import json
 import shutil
 import difflib
+import re
 import subprocess
 import urllib.request
 import urllib.error
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from datetime import datetime
 
 HOME = Path.home()
@@ -18,10 +19,35 @@ BACKUP_DIR = Path(".fox-ai") / "backups"
 
 DEFAULT_IGNORE = {
     ".git", ".fox-ai", "__pycache__", ".venv", "venv",
-    "node_modules", ".idea", ".gradle"
+    "node_modules", ".idea", ".gradle", ".pytest_cache",
+    ".mypy_cache", ".ruff_cache", ".tox", ".nox",
+}
+
+# These files must never be sent to the AI, staged, committed, or pushed by
+# Fox AI.  This is intentionally enforced in Python as well as .gitignore,
+# because .gitignore does not protect files that were already tracked/staged.
+PROTECTED_DIR_NAMES = {
+    ".fox-ai", ".git", ".cache", ".ssh", ".gnupg", "secrets",
+    "credentials", "runtime", "__pycache__", ".pytest_cache",
+    ".mypy_cache", ".ruff_cache", ".tox", ".nox", ".venv", "venv",
+    "node_modules", "coverage", "htmlcov", "build", "dist", "tmp",
+    "temp", "logs",
+}
+PROTECTED_FILE_NAMES = {
+    ".env", ".netrc", ".npmrc", ".pypirc", "credentials",
+    "credentials.json", "secrets.json", "service-account.json",
+    "service_account.json", "runtime.json", "runtime-data.json",
+    "state.json", "session.json", ".session", "id_rsa", "id_dsa",
+    "id_ecdsa", "id_ed25519", "known_hosts", ".coverage",
+}
+PROTECTED_SUFFIXES = {
+    ".key", ".pem", ".p12", ".pfx", ".jks", ".keystore", ".token",
+    ".log", ".pid", ".sock", ".sqlite", ".sqlite3", ".db", ".pyc",
+    ".pyo", ".tmp", ".temp", ".apk", ".aab",
 }
 
 MAX_FILE = 120_000
+MAX_SECRET_SCAN = 2_000_000
 
 
 def load_config():
@@ -69,6 +95,9 @@ ROOT = project_root()
 
 
 def safe_path(rel):
+    if not isinstance(rel, str) or not rel.strip():
+        raise Exception("مسیر فایل نامعتبر است.")
+
     target = (ROOT / rel).resolve()
 
     try:
@@ -79,8 +108,45 @@ def safe_path(rel):
     return target
 
 
+def protected_path_reason(path):
+    """Return a reason when a repository-relative path is sensitive/runtime."""
+    raw = str(path).replace("\\", "/")
+    while raw.startswith("./"):
+        raw = raw[2:]
+
+    if not raw or raw.startswith("/") or "\x00" in raw:
+        return "مسیر نامعتبر"
+
+    parts = [part.casefold() for part in PurePosixPath(raw).parts]
+    if any(part == ".." for part in parts):
+        return "مسیر خارج از پروژه"
+
+    for part in parts[:-1]:
+        if part in PROTECTED_DIR_NAMES:
+            return f"runtime directory: {part}"
+
+    name = parts[-1]
+    if name == ".env" or name.startswith(".env."):
+        return "environment file"
+    if name in PROTECTED_FILE_NAMES:
+        return "credential/runtime file"
+    if any(name.endswith(suffix) for suffix in PROTECTED_SUFFIXES):
+        return "credential/runtime file type"
+    if re.search(
+        r"(^|[._-])(api[._-]?keys?|tokens?|secrets?|credentials?)([._-]|$)",
+        name,
+        re.IGNORECASE,
+    ):
+        return "sensitive filename"
+
+    return None
+
+
 def should_ignore(path):
-    return any(part in DEFAULT_IGNORE for part in path.parts)
+    return (
+        any(part in DEFAULT_IGNORE for part in path.parts)
+        or protected_path_reason(path) is not None
+    )
 
 
 def collect_files():
@@ -543,9 +609,13 @@ def chat():
 🦊 Fox AI Chat
 پروژه: {}
 دستورهای داخلی:
-  /exit   خروج
-  /status وضعیت پروژه
-  /undo   برگشت آخرین backup
+  /exit       خروج
+  /status     وضعیت پروژه و Git
+  /git        وضعیت Git
+  /diff       تغییرات Git
+  /sync       دریافت امن تغییرات remote
+  /push       add/commit/push با تأییدهای صریح
+  /undo       برگشت آخرین backup
 
 هر درخواست دیگری را مستقیم به AI می‌فرستیم.
 """.format(ROOT))
@@ -570,6 +640,23 @@ def chat():
 
         if cmd == "/status":
             status()
+            git_status()
+            continue
+
+        if cmd == "/git":
+            git_status()
+            continue
+
+        if cmd == "/diff":
+            git_diff()
+            continue
+
+        if cmd == "/sync":
+            git_sync()
+            continue
+
+        if cmd == "/push":
+            git_push()
             continue
 
         if cmd == "/undo":
@@ -686,222 +773,850 @@ CURRENT REQUEST:
             print(f"\n❌ خطا در ارتباط با AI:\n{e}")
 
 
+
+# --- Safe Git/GitHub integration ------------------------------------------
+
+
+def _display_path(path):
+    """Keep terminal control characters out of paths shown to the user."""
+    return "".join(ch if ch.isprintable() else f"\\x{ord(ch):02x}" for ch in path)
+
+
+def _redact_remote_url(url):
+    # Redact URL user-info so embedded credentials are never displayed.
+    return re.sub(r"(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@", r"\1***@", url)
+
+
+def git_cmd(*args, root=None, timeout=60):
+    """Run Git without a shell and return (returncode, stdout, stderr)."""
+    worktree = Path(root or ROOT).resolve()
+    if shutil.which("git") is None:
+        return 127, "", "دستور git نصب نیست. در Termux اجرا کنید: pkg install git"
+
+    env = os.environ.copy()
+    env.setdefault("GIT_TERMINAL_PROMPT", "1")
+    try:
+        result = subprocess.run(
+            ["git", *[str(arg) for arg in args]],
+            cwd=worktree,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+        )
+        return (
+            result.returncode,
+            result.stdout.rstrip("\n"),
+            result.stderr.rstrip("\n"),
+        )
+    except subprocess.TimeoutExpired:
+        return 124, "", "مهلت اجرای git تمام شد."
+    except Exception as exc:
+        return 1, "", str(exc)
+
+
+def _git_interactive(*args, root=None):
+    """Run an explicitly approved operation with Git attached to the terminal."""
+    worktree = Path(root or ROOT).resolve()
+    env = os.environ.copy()
+    env.setdefault("GIT_TERMINAL_PROMPT", "1")
+    try:
+        result = subprocess.run(
+            ["git", *[str(arg) for arg in args]],
+            cwd=worktree,
+            env=env,
+        )
+        return result.returncode
+    except Exception as exc:
+        print(f"❌ اجرای git ناموفق بود: {exc}")
+        return 1
+
+
+def _git_root(show_error=True):
+    code, out, err = git_cmd("rev-parse", "--show-toplevel")
+    if code != 0 or not out:
+        if show_error:
+            print("❌ پوشه فعلی داخل Git repository نیست.")
+            if err:
+                print(err)
+        return None
+    return Path(out).resolve()
+
+
+def _remote_target(root, branch, remotes):
+    """Find the configured remote and remote branch without guessing silently."""
+    remote = ""
+    remote_branch = branch
+
+    if branch:
+        _, configured_remote, _ = git_cmd(
+            "config", "--get", f"branch.{branch}.remote", root=root
+        )
+        _, merge_ref, _ = git_cmd(
+            "config", "--get", f"branch.{branch}.merge", root=root
+        )
+        if configured_remote in remotes and configured_remote != ".":
+            remote = configured_remote
+        if merge_ref.startswith("refs/heads/"):
+            remote_branch = merge_ref[len("refs/heads/"):]
+
+    if not remote:
+        if "origin" in remotes:
+            remote = "origin"
+        elif len(remotes) == 1:
+            remote = remotes[0]
+
+    return remote, remote_branch
+
+
+def _git_info(show_error=True):
+    root = _git_root(show_error=show_error)
+    if root is None:
+        return None
+
+    code, branch, _ = git_cmd(
+        "symbolic-ref", "--quiet", "--short", "HEAD", root=root
+    )
+    if code != 0:
+        branch = ""
+
+    _, head, _ = git_cmd("rev-parse", "--short", "HEAD", root=root)
+    _, remote_text, _ = git_cmd("remote", root=root)
+    remotes = [item for item in remote_text.splitlines() if item]
+    remote, remote_branch = _remote_target(root, branch, remotes)
+
+    upstream = ""
+    if branch:
+        up_code, up_out, _ = git_cmd(
+            "rev-parse", "--abbrev-ref", "--symbolic-full-name",
+            "@{upstream}", root=root,
+        )
+        if up_code == 0:
+            upstream = up_out
+
+    return {
+        "root": root,
+        "branch": branch,
+        "head": head,
+        "remotes": remotes,
+        "remote": remote,
+        "remote_branch": remote_branch,
+        "upstream": upstream,
+    }
+
+
+def _status_entries(root):
+    code, output, err = git_cmd(
+        "status", "--porcelain=v1", "-z", "--untracked-files=all", root=root
+    )
+    if code != 0:
+        return None, err or output
+
+    records = output.split("\x00")
+    entries = []
+    index = 0
+    while index < len(records):
+        record = records[index]
+        index += 1
+        if not record:
+            continue
+        if len(record) < 3:
+            continue
+
+        xy = record[:2]
+        path = record[3:]
+        original = None
+        # In porcelain v1 -z format a rename/copy is: "XY new\0old\0".
+        if (xy[0] in "RC" or xy[1] in "RC") and index < len(records):
+            original = records[index] or None
+            index += 1
+        entries.append({"xy": xy, "path": path, "original": original})
+
+    return entries, ""
+
+
+def _entry_paths(entry):
+    paths = [entry["path"]]
+    if entry.get("original"):
+        paths.append(entry["original"])
+    return paths
+
+
+def _ahead_behind(root, left, right):
+    code, output, _ = git_cmd(
+        "rev-list", "--left-right", "--count", f"{left}...{right}", root=root
+    )
+    if code != 0:
+        return None, None
+    try:
+        left_count, right_count = output.split()
+        return int(left_count), int(right_count)
+    except (TypeError, ValueError):
+        return None, None
+
+
+def git_status():
+    info = _git_info()
+    if info is None:
+        return False
+
+    root = info["root"]
+    print("\n🦊 Git status")
+    print(f"Repository: {root}")
+    if info["branch"]:
+        print(f"Branch: {info['branch']} ({info['head']})")
+    else:
+        print(f"Branch: detached HEAD ({info['head'] or 'unknown'})")
+
+    if info["remotes"]:
+        print("Remotes:")
+        for remote in info["remotes"]:
+            _, url, _ = git_cmd("remote", "get-url", remote, root=root)
+            suffix = "  ← selected" if remote == info["remote"] else ""
+            print(f"  {remote}: {_redact_remote_url(url)}{suffix}")
+    else:
+        print("Remotes: (none)")
+
+    print(f"Upstream: {info['upstream'] or '(not configured)'}")
+    if info["upstream"]:
+        ahead, behind = _ahead_behind(root, "HEAD", info["upstream"])
+        if ahead is not None:
+            print(f"Ahead/behind: {ahead}/{behind}")
+
+    entries, err = _status_entries(root)
+    if entries is None:
+        print(f"❌ git status: {err}")
+        return False
+
+    print("Changes:")
+    if not entries:
+        print("  clean")
+    for entry in entries:
+        reason = next(
+            (protected_path_reason(path) for path in _entry_paths(entry)
+             if protected_path_reason(path)),
+            None,
+        )
+        protected = f"  [محافظت‌شده: {reason}]" if reason else ""
+        rename = ""
+        if entry.get("original"):
+            rename = f" <- {_display_path(entry['original'])}"
+        print(
+            f"  {entry['xy']} {_display_path(entry['path'])}{rename}{protected}"
+        )
+    return True
+
+
+def _safe_diff_paths(entries, staged):
+    paths = []
+    blocked = []
+    for entry in entries:
+        xy = entry["xy"]
+        changed = (xy[0] not in (" ", "?", "!")) if staged else (
+            xy[1] not in (" ", "?", "!")
+        )
+        if not changed:
+            continue
+        entry_paths = _entry_paths(entry)
+        reasons = [protected_path_reason(path) for path in entry_paths]
+        if any(reasons):
+            blocked.extend(entry_paths)
+            continue
+        paths.extend(entry_paths)
+    return sorted(set(paths)), sorted(set(blocked))
+
+
+def git_diff():
+    info = _git_info()
+    if info is None:
+        return False
+    root = info["root"]
+    entries, err = _status_entries(root)
+    if entries is None:
+        print(f"❌ git diff: {err}")
+        return False
+
+    unstaged, blocked_worktree = _safe_diff_paths(entries, staged=False)
+    staged, blocked_index = _safe_diff_paths(entries, staged=True)
+    printed = False
+
+    if unstaged:
+        code, output, err = git_cmd(
+            "diff", "--no-ext-diff", "--color=never", "--", *unstaged, root=root
+        )
+        if code != 0:
+            print(f"❌ git diff: {err or output}")
+            return False
+        if output:
+            print("\n--- تغییرات stage نشده ---")
+            print(output)
+            printed = True
+
+    if staged:
+        code, output, err = git_cmd(
+            "diff", "--cached", "--no-ext-diff", "--color=never", "--",
+            *staged, root=root,
+        )
+        if code != 0:
+            print(f"❌ git diff --cached: {err or output}")
+            return False
+        if output:
+            print("\n--- تغییرات stage شده ---")
+            print(output)
+            printed = True
+
+    blocked = sorted(set(blocked_worktree + blocked_index))
+    if blocked:
+        print("\n🔒 محتوای فایل‌های محافظت‌شده نمایش داده نشد:")
+        for path in blocked:
+            print(f"  {_display_path(path)}")
+
+    untracked = [
+        entry["path"] for entry in entries
+        if entry["xy"] == "??" and not protected_path_reason(entry["path"])
+    ]
+    if untracked:
+        print("\nفایل‌های جدید (برای diff ابتدا باید stage شوند):")
+        for path in untracked:
+            print(f"  {_display_path(path)}")
+
+    if not printed and not blocked and not untracked:
+        print("✅ هیچ تغییر محلی وجود ندارد.")
+    return True
+
+
+def _chunks(items, size=100):
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
+
+
+def _unstage_paths(root, paths):
+    ok = True
+    for chunk in _chunks(sorted(set(paths))):
+        code, out, err = git_cmd("restore", "--staged", "--", *chunk, root=root)
+        if code != 0:
+            code, out, err = git_cmd("reset", "-q", "HEAD", "--", *chunk, root=root)
+        if code != 0:
+            print(f"❌ خارج کردن فایل محافظت‌شده از stage ناموفق بود: {err or out}")
+            ok = False
+    return ok
+
+
+_SECRET_PATTERNS = (
+    ("private key", re.compile(r"-----BEGIN (?:RSA |DSA |EC |OPENSSH )?PRIVATE KEY-----")),
+    ("GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}\b")),
+    ("GitHub token", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{30,}\b")),
+    ("OpenAI-style key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b")),
+    ("AWS access key", re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")),
+    ("Google API key", re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b")),
+    ("Slack token", re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{20,}\b")),
+    ("credential in URL", re.compile(r"[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s/@]+@", re.I)),
+)
+_SECRET_ASSIGNMENT = re.compile(
+    r'''(?ix)
+    ["']?(api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|
+    password|passwd|private[_-]?key|credentials?)["']?
+    \s*[:=]\s*["']([^"'\r\n]{8,})["']
+    '''
+)
+_SECRET_UNQUOTED_ASSIGNMENT = re.compile(
+    r'''(?imx)^
+    \s*["']?(api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|
+    password|passwd|private[_-]?key|credentials?)["']?
+    \s*[:=]\s*([A-Za-z0-9_./+@:=~-]{8,})\s*(?:[#;].*)?$
+    '''
+)
+_PLACEHOLDER_WORDS = (
+    "example", "sample", "placeholder", "your_", "your-", "changeme",
+    "change_me", "dummy", "not-a-real", "redacted", "<", "${", "$",
+)
+
+
+def _secret_labels(text):
+    labels = []
+    for label, pattern in _SECRET_PATTERNS:
+        if pattern.search(text):
+            labels.append(label)
+
+    for assignment_pattern in (_SECRET_ASSIGNMENT, _SECRET_UNQUOTED_ASSIGNMENT):
+        for match in assignment_pattern.finditer(text):
+            value = match.group(2).strip().casefold()
+            if value and not any(word in value for word in _PLACEHOLDER_WORDS):
+                labels.append(f"literal {match.group(1)}")
+
+    return sorted(set(labels))
+
+
+def _read_git_blob(root, object_name):
+    size_code, size_text, _ = git_cmd("cat-file", "-s", object_name, root=root)
+    if size_code != 0:
+        return None
+    try:
+        if int(size_text.strip()) > MAX_SECRET_SCAN:
+            return None
+    except ValueError:
+        return None
+
+    code, content, _ = git_cmd(
+        "cat-file", "blob", object_name, root=root, timeout=120
+    )
+    if code != 0 or "\x00" in content:
+        return None
+    return content
+
+
+def _cached_paths(root):
+    code, output, err = git_cmd(
+        "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR",
+        root=root,
+    )
+    if code != 0:
+        return None, err or output
+    return [path for path in output.split("\x00") if path], ""
+
+
+def _scan_staged_secrets(root):
+    paths, err = _cached_paths(root)
+    if paths is None:
+        return None, err
+
+    findings = []
+    for path in paths:
+        content = _read_git_blob(root, f":{path}")
+        if content is None:
+            continue
+        for label in _secret_labels(content):
+            findings.append((path, label))
+    return findings, ""
+
+
+def _stage_safe_changes(root):
+    entries, err = _status_entries(root)
+    if entries is None:
+        print(f"❌ خواندن تغییرات ناموفق بود: {err}")
+        return False
+
+    protected = []
+    safe = []
+    staged_protected = []
+    for entry in entries:
+        paths = _entry_paths(entry)
+        reasons = [protected_path_reason(path) for path in paths]
+        if any(reasons):
+            protected.extend((path, reason) for path, reason in zip(paths, reasons) if reason)
+            if entry["xy"][0] not in (" ", "?", "!"):
+                staged_protected.extend(paths)
+            continue
+        safe.extend(paths)
+
+    if staged_protected and not _unstage_paths(root, staged_protected):
+        return False
+
+    for chunk in _chunks(sorted(set(safe))):
+        code, out, err = git_cmd("add", "-A", "--", *chunk, root=root)
+        if code != 0:
+            print(f"❌ git add ناموفق بود: {err or out}")
+            return False
+
+    # Re-check the actual index. This also protects against files staged before
+    # Fox AI started and against Git pathspec edge cases.
+    code, output, err = git_cmd(
+        "diff", "--cached", "--name-only", "-z", root=root
+    )
+    if code != 0:
+        print(f"❌ بررسی stage ناموفق بود: {err or output}")
+        return False
+    indexed = [path for path in output.split("\x00") if path]
+    forbidden_indexed = [path for path in indexed if protected_path_reason(path)]
+    if forbidden_indexed:
+        if not _unstage_paths(root, forbidden_indexed):
+            return False
+        protected.extend(
+            (path, protected_path_reason(path)) for path in forbidden_indexed
+        )
+
+    if protected:
+        print("\n🔒 فایل‌های زیر هرگز stage/commit نمی‌شوند:")
+        shown = set()
+        for path, reason in protected:
+            if path in shown:
+                continue
+            shown.add(path)
+            print(f"  {_display_path(path)} ({reason})")
+
+    findings, scan_error = _scan_staged_secrets(root)
+    if findings is None:
+        print(f"❌ اسکن امنیتی stage ناموفق بود: {scan_error}")
+        return False
+    if findings:
+        bad_paths = sorted({path for path, _ in findings})
+        _unstage_paths(root, bad_paths)
+        print("\n❌ secret احتمالی پیدا شد؛ فایل‌ها از stage خارج شدند:")
+        for path, label in findings:
+            print(f"  {_display_path(path)} ({label})")
+        return False
+
+    code, _, _ = git_cmd("diff", "--cached", "--quiet", root=root)
+    if code == 0:
+        print("✅ پس از حذف فایل‌های محافظت‌شده، تغییری برای commit نماند.")
+        return False
+    if code != 1:
+        print("❌ بررسی تغییرات stage شده ناموفق بود.")
+        return False
+    return True
+
+
+def _confirm_exact(prompt, expected):
+    try:
+        answer = input(prompt).strip().casefold()
+    except (EOFError, KeyboardInterrupt):
+        print("\n❎ لغو شد.")
+        return False
+    return answer == expected.casefold()
+
+
+def _outgoing_commits(root, remote):
+    code, output, err = git_cmd(
+        "rev-list", "--reverse", "HEAD", "--not", f"--remotes={remote}", root=root
+    )
+    if code != 0:
+        return None, err or output
+    return [commit for commit in output.splitlines() if commit], ""
+
+
+def _commit_paths(root, commit):
+    code, output, err = git_cmd(
+        "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "-z",
+        commit, root=root,
+    )
+    if code != 0:
+        return None, err or output
+    return [path for path in output.split("\x00") if path], ""
+
+
+def _audit_outgoing(root, commits):
+    """Audit every commit that a push would introduce to the remote."""
+    findings = []
+    for commit in commits:
+        msg_code, message, msg_err = git_cmd(
+            "show", "-s", "--format=%B", commit, root=root
+        )
+        if msg_code != 0:
+            return None, msg_err or message
+        for label in _secret_labels(message):
+            findings.append((commit[:10], "<commit message>", label))
+
+        paths, err = _commit_paths(root, commit)
+        if paths is None:
+            return None, err
+        for path in paths:
+            reason = protected_path_reason(path)
+            if reason:
+                findings.append((commit[:10], path, reason))
+                continue
+            content = _read_git_blob(root, f"{commit}:{path}")
+            if content is None:
+                continue  # Deleted, binary, or too large.
+            for label in _secret_labels(content):
+                findings.append((commit[:10], path, label))
+    return findings, ""
+
+
+def _refresh_remote(info):
+    remote = info["remote"]
+    code, out, err = git_cmd("fetch", "--no-tags", remote, root=info["root"], timeout=180)
+    if code != 0:
+        print(f"❌ git fetch ناموفق بود: {err or out}")
+        return False
+    return True
+
+
+def git_push():
+    """Safely stage, commit, and push; commit and push require separate consent."""
+    info = _git_info()
+    if info is None:
+        return False
+    root = info["root"]
+    branch = info["branch"]
+    remote = info["remote"]
+    remote_branch = info["remote_branch"]
+
+    if not branch:
+        print("❌ در detached HEAD امکان commit/push امن وجود ندارد.")
+        return False
+    if not remote:
+        print("❌ remote مشخص نیست؛ ابتدا origin یا upstream شاخه را تنظیم کنید.")
+        return False
+
+    _, remote_url, _ = git_cmd("remote", "get-url", remote, root=root)
+    print(f"\n🦊 Repository: {root}")
+    print(f"Branch: {branch}")
+    print(f"Remote: {remote} ({_redact_remote_url(remote_url)})")
+    print(f"Remote branch: {remote_branch}")
+
+    entries, err = _status_entries(root)
+    if entries is None:
+        print(f"❌ git status ناموفق بود: {err}")
+        return False
+
+    if entries:
+        git_diff()
+        print(
+            "\nبرای stage کردن فقط فایل‌های امن، عبارت stage را دقیقاً وارد کنید."
+        )
+        if not _confirm_exact("تأیید git add [stage/cancel]: ", "stage"):
+            print("❎ git add/commit لغو شد.")
+            return False
+        if not _stage_safe_changes(root):
+            return False
+
+        print("\n📋 diff نهاییِ stage شده:")
+        git_diff()
+        try:
+            message = input("\n📝 پیام commit (خالی = لغو): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n❎ لغو شد.")
+            return False
+        if not message:
+            print("❎ commit لغو شد.")
+            return False
+        message_findings = _secret_labels(message)
+        if message_findings:
+            print("❌ پیام commit شبیه secret/credential است و پذیرفته نشد.")
+            return False
+
+        print('برای ساخت commit عبارت "commit" را دقیقاً وارد کنید.')
+        if not _confirm_exact("تأیید commit [commit/cancel]: ", "commit"):
+            print("❎ commit لغو شد؛ تغییرات فقط stage شده‌اند.")
+            return False
+
+        # --no-verify prevents a hook from silently adding files after the
+        # security audit. The resulting commit is audited again before push.
+        code, out, err = git_cmd(
+            "commit", "--no-verify", "-m", message, root=root, timeout=180
+        )
+        if code != 0:
+            print(f"❌ git commit ناموفق بود: {err or out}")
+            return False
+        print(out or "✅ commit ساخته شد.")
+
+    if not _refresh_remote(info):
+        return False
+
+    remote_ref = f"refs/remotes/{remote}/{remote_branch}"
+    ref_code, _, _ = git_cmd("show-ref", "--verify", "--quiet", remote_ref, root=root)
+    if ref_code == 0:
+        ahead, behind = _ahead_behind(root, "HEAD", remote_ref)
+        if behind:
+            print(
+                f"❌ شاخه محلی {behind} commit عقب است؛ ابتدا fox-ai git sync را اجرا کنید."
+            )
+            return False
+        if ahead == 0:
+            print("✅ commit جدیدی برای push وجود ندارد.")
+            return True
+
+    commits, commit_error = _outgoing_commits(root, remote)
+    if commits is None:
+        print(f"❌ بررسی commitهای خروجی ناموفق بود: {commit_error}")
+        return False
+    if not commits:
+        print("✅ commit جدیدی برای push وجود ندارد.")
+        return True
+
+    findings, audit_error = _audit_outgoing(root, commits)
+    if findings is None:
+        print(f"❌ ممیزی امنیتی push ناموفق بود: {audit_error}")
+        return False
+    if findings:
+        print("❌ push مسدود شد؛ commit خروجی شامل داده محافظت‌شده است:")
+        for commit, path, reason in findings[:50]:
+            print(f"  {commit}  {_display_path(path)} ({reason})")
+        if len(findings) > 50:
+            print(f"  ... و {len(findings) - 50} مورد دیگر")
+        return False
+
+    print(f"\n{len(commits)} commit به {remote}/{remote_branch} ارسال خواهد شد.")
+    code, summary, _ = git_cmd(
+        "log", "--no-walk", "--oneline", "--decorate", *commits[-10:], root=root
+    )
+    if code == 0 and summary:
+        print(summary)
+    print('برای push عبارت "push" را دقیقاً وارد کنید.')
+    if not _confirm_exact("تأیید push [push/cancel]: ", "push"):
+        print("❎ push لغو شد؛ commit محلی باقی ماند.")
+        return False
+
+    result = _git_interactive(
+        "push", "--set-upstream", remote,
+        f"{branch}:refs/heads/{remote_branch}", root=root,
+    )
+    if result != 0:
+        print("❌ git push ناموفق بود؛ commit محلی حذف نشده است.")
+        return False
+
+    print("🚀 push با موفقیت انجام شد.")
+    return True
+
+
+def git_sync():
+    """Fetch and fast-forward the current branch after an explicit preview."""
+    info = _git_info()
+    if info is None:
+        return False
+    root = info["root"]
+    branch = info["branch"]
+    remote = info["remote"]
+    remote_branch = info["remote_branch"]
+
+    if not branch:
+        print("❌ در detached HEAD امکان sync امن وجود ندارد.")
+        return False
+    if not remote:
+        print("❌ remote مشخص نیست؛ ابتدا origin یا upstream را تنظیم کنید.")
+        return False
+
+    entries, err = _status_entries(root)
+    if entries is None:
+        print(f"❌ git status ناموفق بود: {err}")
+        return False
+    if entries:
+        print("❌ برای جلوگیری از overwrite، sync فقط با working tree کاملاً clean اجرا می‌شود:")
+        for entry in entries:
+            print(f"  {entry['xy']} {_display_path(entry['path'])}")
+        return False
+
+    print(f"🦊 Fetching {remote} ({remote_branch}) ...")
+    if not _refresh_remote(info):
+        return False
+
+    remote_ref = f"refs/remotes/{remote}/{remote_branch}"
+    code, _, _ = git_cmd("show-ref", "--verify", "--quiet", remote_ref, root=root)
+    if code != 0:
+        print(f"❌ شاخه {remote}/{remote_branch} روی remote پیدا نشد.")
+        return False
+
+    ahead, behind = _ahead_behind(root, "HEAD", remote_ref)
+    if ahead is None:
+        print("❌ مقایسه شاخه محلی و remote ناموفق بود.")
+        return False
+    if ahead and behind:
+        print(
+            f"❌ شاخه‌ها diverged هستند (ahead={ahead}, behind={behind})؛ "
+            "sync خودکار انجام نشد."
+        )
+        return False
+    if not behind:
+        if ahead:
+            print(f"✅ شاخه local به‌روز و {ahead} commit جلوتر است.")
+        else:
+            print("✅ پروژه با remote همگام است.")
+        return True
+
+    print(f"\n{behind} commit دریافت و با fast-forward اعمال می‌شود:")
+    _, log_output, _ = git_cmd(
+        "log", "--oneline", "--decorate", f"HEAD..{remote_ref}", root=root
+    )
+    if log_output:
+        print(log_output)
+    print('برای به‌روزرسانی فایل‌های محلی عبارت "sync" را دقیقاً وارد کنید.')
+    if not _confirm_exact("تأیید sync [sync/cancel]: ", "sync"):
+        print("❎ sync لغو شد؛ فقط fetch انجام شده است.")
+        return False
+
+    code, out, err = git_cmd(
+        "merge", "--ff-only", remote_ref, root=root, timeout=180
+    )
+    if code != 0:
+        print(f"❌ fast-forward ناموفق بود: {err or out}")
+        return False
+    print(out or "✅ sync با موفقیت انجام شد.")
+    return True
+
+
+def _git_usage():
+    print("""
+Git commands:
+  fox-ai git status    نمایش repository، branch، remote و تغییرات
+  fox-ai git diff      نمایش diff امن (بدون محتوای فایل‌های حساس)
+  fox-ai git sync      fetch و fast-forward پس از تأیید
+  fox-ai git push      git add/commit/push با تأییدهای صریح و اسکن امنیتی
+
+Aliasها: fox-ai diff | sync | push
+""")
+
+
 def main():
     global ROOT
     ROOT = project_root()
 
     args = sys.argv[1:]
-
-    if not args:
+    if not args or args[0].lower() in ("-h", "--help", "help"):
         print("""
 🦊 Fox AI Coding Agent
 
 استفاده:
-
   fox-ai "درخواست شما"
-
+  fox-ai chat
   fox-ai config
   fox-ai status
   fox-ai undo
 
-مثال:
+Git واقعی:
+  fox-ai git status
+  fox-ai git diff
+  fox-ai git sync
+  fox-ai git push
 
-  fox-ai "فیلتر اسم حسین را بررسی کن و اگر مشکل دارد اصلاحش کن و تست اضافه کن"
+هیچ commit یا push بدون تأیید صریح انجام نمی‌شود.
 """)
-        return
+        return 0
 
     command = args[0].lower()
 
     if command == "config":
         configure()
-        return
-
+        return 0
     if command == "status":
         status()
-        return
-
+        print()
+        return 0 if git_status() else 1
     if command == "undo":
         undo()
-        return
-
+        return 0
     if command == "chat":
         chat()
-        return
+        return 0
+
+    if command == "git":
+        subcommand = args[1].lower() if len(args) > 1 else "status"
+        handlers = {
+            "status": git_status,
+            "diff": git_diff,
+            "sync": git_sync,
+            "push": git_push,
+            "publish": git_push,
+        }
+        handler = handlers.get(subcommand)
+        if handler is None:
+            print(f"❌ زیر‌دستور Git ناشناخته است: {subcommand}")
+            _git_usage()
+            return 2
+        return 0 if handler() else 1
+
+    aliases = {
+        "diff": git_diff,
+        "sync": git_sync,
+        "push": git_push,
+    }
+    if command in aliases:
+        return 0 if aliases[command]() else 1
 
     run_request(" ".join(args))
-
+    return 0
 
 
 if __name__ == "__main__":
-    if len(sys.argv) >= 2:
-        command = sys.argv[1]
-
-        if command == "git":
-            git_status()
-            raise SystemExit
-
-        if command == "diff":
-            git_diff()
-            raise SystemExit
-
-        if command == "push":
-            git_push()
-            raise SystemExit
-
-        if command == "sync":
-            git_sync()
-            raise SystemExit
-
-if __name__ == "__main__":
-    main()
-
-if __name__ == "__main__":
-    if len(sys.argv) >= 2:
-        command = sys.argv[1]
-
-        if command == "git":
-            git_status()
-            raise SystemExit
-
-        if command == "diff":
-            git_diff()
-            raise SystemExit
-
-        if command == "push":
-            git_push()
-            raise SystemExit
-
-        if command == "sync":
-            git_sync()
-            raise SystemExit
-
-if __name__ == "__main__":
-    main()
-
-# --- GitHub integration ---
-def git_cmd(*args):
-    try:
-        r = subprocess.run(
-            ["git", *args],
-            cwd=project_root(),
-            text=True,
-            capture_output=True,
-            timeout=30,
-        )
-        return r.returncode, r.stdout.strip(), r.stderr.strip()
-    except Exception as e:
-        return 1, "", str(e)
-
-def git_status():
-    code, branch, err = git_cmd("branch", "--show-current")
-    if code != 0:
-        print(f"❌ Git: {err}")
-        return
-
-    _, remote, _ = git_cmd("remote", "get-url", "origin")
-    _, status, _ = git_cmd("status", "--short")
-
-    print("🦊 GitHub")
-    print(f"Project: {project_root()}")
-    print(f"Branch: {branch or '(unknown)'}")
-    print(f"Remote: {remote or '(not configured)'}")
-    print("Status:")
-    print(status or "  clean")
-
-def git_diff():
-    _, diff, err = git_cmd("diff", "--")
-    if err:
-        print(f"❌ {err}")
-        return
-    print(diff or "✅ No local changes.")
-
-def git_push():
-    root = project_root()
-
-    code, branch, err = git_cmd("branch", "--show-current")
-    if code != 0 or not branch:
-        print("❌ شاخه Git پیدا نشد.")
-        return
-
-    code, remote, err = git_cmd("remote", "get-url", "origin")
-    if code != 0 or not remote:
-        print("❌ remote به GitHub تنظیم نشده.")
-        return
-
-    print(f"🦊 Branch: {branch}")
-    print(f"🌐 Remote: {remote}")
-
-    _, status, _ = git_cmd("status", "--short")
-    if not status:
-        print("✅ تغییری برای ارسال وجود ندارد.")
-        return
-
-    print("\n📋 تغییرات:")
-    git_diff()
-
-    answer = input("\nCommit و Push انجام شود؟ [y/N]: ").strip().lower()
-    if answer != "y":
-        print("❎ لغو شد.")
-        return
-
-    # Protect sensitive files from accidental staging.
-    protected = [
-        ".env",
-        ".env.*",
-        "*.key",
-        "*.pem",
-        "*.token",
-        "*secret*",
-        "*credential*",
-    ]
-
-    for pattern in protected:
-        git_cmd("reset", "--", pattern)
-
-    code, out, err = git_cmd("add", "-A")
-    if code != 0:
-        print(f"❌ git add: {err}")
-        return
-
-    # Remove sensitive files from the index if they were accidentally staged.
-    for pattern in protected:
-        git_cmd("reset", "--", pattern)
-
-    message = input("📝 پیام Commit: ").strip()
-    if not message:
-        message = "Update project via Fox AI"
-
-    code, out, err = git_cmd("commit", "-m", message)
-    if code != 0:
-        print(f"❌ git commit: {err or out}")
-        return
-
-    print("✅ Commit ساخته شد.")
-
-    code, out, err = git_cmd("push", "origin", branch)
-    if code != 0:
-        print(f"❌ git push: {err or out}")
-        return
-
-    print("🚀 با موفقیت به GitHub Push شد.")
-
-def git_sync():
-    print("🦊 Git Sync")
-    code, branch, err = git_cmd("branch", "--show-current")
-    if code != 0 or not branch:
-        print("❌ شاخه Git پیدا نشد.")
-        return
-
-    _, status, _ = git_cmd("status", "--short")
-    if status:
-        print("⚠️ تغییرات محلی داری؛ قبل از pull آنها را بررسی کن:")
-        print(status)
-        return
-
-    code, out, err = git_cmd("pull", "--ff-only", "origin", branch)
-    if code != 0:
-        print(f"❌ git pull: {err or out}")
-        return
-
-    print(out or "✅ پروژه با GitHub همگام شد.")
-
+    raise SystemExit(main())
