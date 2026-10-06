@@ -1,9 +1,11 @@
-# Fox AI runtime data and backups
+# Fox AI runtime data and local configuration
 .fox-ai/
+.config/fox-ai/
 
 # Environment and credentials
 .env
 .env.*
+cloudflare.env
 *.key
 *.pem
 *.p12

@@ -5,6 +5,7 @@ import sys
 import json
 import shutil
 import difflib
+import getpass
 import re
 import subprocess
 import urllib.request
@@ -15,7 +16,19 @@ from datetime import datetime
 HOME = Path.home()
 CONFIG_DIR = HOME / ".config" / "fox-ai"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+CLOUDFLARE_ENV_FILE = CONFIG_DIR / "cloudflare.env"
 BACKUP_DIR = Path(".fox-ai") / "backups"
+
+# Verified against Cloudflare's official model catalog on 2026-10-06:
+# https://developers.cloudflare.com/workers-ai/models/glm-5.3/
+CLOUDFLARE_MODEL = "@cf/zai-org/glm-5.3"
+# Official OpenAI-compatible endpoint documentation:
+# https://developers.cloudflare.com/workers-ai/configuration/open-ai-compatibility/
+CLOUDFLARE_API_ROOT = "https://api.cloudflare.com/client/v4/accounts"
+CLOUDFLARE_CREDENTIAL_NAMES = (
+    "CLOUDFLARE_ACCOUNT_ID",
+    "CLOUDFLARE_API_TOKEN",
+)
 
 DEFAULT_IGNORE = {
     ".git", ".fox-ai", "__pycache__", ".venv", "venv",
@@ -27,14 +40,14 @@ DEFAULT_IGNORE = {
 # Fox AI.  This is intentionally enforced in Python as well as .gitignore,
 # because .gitignore does not protect files that were already tracked/staged.
 PROTECTED_DIR_NAMES = {
-    ".fox-ai", ".git", ".cache", ".ssh", ".gnupg", "secrets",
+    ".fox-ai", ".git", ".config", ".cache", ".ssh", ".gnupg", "secrets",
     "credentials", "runtime", "__pycache__", ".pytest_cache",
     ".mypy_cache", ".ruff_cache", ".tox", ".nox", ".venv", "venv",
     "node_modules", "coverage", "htmlcov", "build", "dist", "tmp",
     "temp", "logs",
 }
 PROTECTED_FILE_NAMES = {
-    ".env", ".netrc", ".npmrc", ".pypirc", "credentials",
+    ".env", "cloudflare.env", ".netrc", ".npmrc", ".pypirc", "credentials",
     "credentials.json", "secrets.json", "service-account.json",
     "service_account.json", "runtime.json", "runtime-data.json",
     "state.json", "session.json", ".session", "id_rsa", "id_dsa",
@@ -50,10 +63,24 @@ MAX_FILE = 120_000
 MAX_SECRET_SCAN = 2_000_000
 
 
+def _without_cloudflare_credentials(cfg):
+    """Keep Cloudflare credentials out of the legacy JSON config."""
+    if not isinstance(cfg, dict):
+        return {}
+    blocked = {name.casefold() for name in CLOUDFLARE_CREDENTIAL_NAMES}
+    return {
+        key: value
+        for key, value in cfg.items()
+        if str(key).casefold() not in blocked
+        and not str(key).casefold().startswith("cloudflare_")
+    }
+
+
 def load_config():
     if CONFIG_FILE.exists():
         try:
-            return json.loads(CONFIG_FILE.read_text())
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            return _without_cloudflare_credentials(data)
         except Exception:
             pass
 
@@ -66,10 +93,316 @@ def load_config():
 
 def save_config(cfg):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    safe_config = _without_cloudflare_credentials(cfg)
     CONFIG_FILE.write_text(
-        json.dumps(cfg, ensure_ascii=False, indent=2)
+        json.dumps(safe_config, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
     os.chmod(CONFIG_FILE, 0o600)
+
+
+class ProviderConfigurationError(Exception):
+    """A provider is not safely/configurably available."""
+
+
+class ProviderRequestError(Exception):
+    """A provider request failed without exposing response bodies or secrets."""
+
+    def __init__(self, provider, reason, fallbackable=False):
+        super().__init__(reason)
+        self.provider = provider
+        self.reason = reason
+        self.fallbackable = fallbackable
+
+
+class NoProviderAvailableError(Exception):
+    """No configured provider could complete a request."""
+
+
+def _parse_cloudflare_env(text):
+    """Parse only the two supported keys; never execute or expand env content."""
+    values = {}
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            raise ProviderConfigurationError(
+                f"ساختار cloudflare.env در خط {line_number} نامعتبر است."
+            )
+
+        key, raw_value = line.split("=", 1)
+        key = key.strip()
+        if key not in CLOUDFLARE_CREDENTIAL_NAMES:
+            # Ignore unrelated local settings instead of exposing their values.
+            continue
+
+        raw_value = raw_value.strip()
+        if raw_value.startswith(("\"", "'")):
+            quote = raw_value[0]
+            if len(raw_value) < 2 or raw_value[-1] != quote:
+                raise ProviderConfigurationError(
+                    f"مقدار نقل‌قول‌شده در خط {line_number} کامل نیست."
+                )
+            value = raw_value[1:-1]
+        else:
+            # Allow an inline comment only when it starts after whitespace.
+            value = re.split(r"\s+#", raw_value, maxsplit=1)[0].strip()
+
+        if "\x00" in value or "\n" in value or "\r" in value:
+            raise ProviderConfigurationError(
+                f"مقدار cloudflare.env در خط {line_number} نامعتبر است."
+            )
+        values[key] = value
+
+    return values
+
+
+def load_cloudflare_credentials(path=None, environ=None):
+    """Load Cloudflare credentials without copying them into app config/logs."""
+    env = os.environ if environ is None else environ
+    env_values = {
+        name: str(env.get(name, "")).strip()
+        for name in CLOUDFLARE_CREDENTIAL_NAMES
+    }
+
+    # Complete environment credentials take precedence and do not require
+    # touching a local credential file.
+    if all(env_values.values()):
+        values = env_values
+    else:
+        credential_path = Path(path or CLOUDFLARE_ENV_FILE).expanduser()
+        values = {}
+        if credential_path.exists():
+            try:
+                file_stat = credential_path.stat()
+                if not credential_path.is_file():
+                    raise ProviderConfigurationError(
+                        "مسیر Cloudflare credential یک فایل عادی نیست."
+                    )
+                if file_stat.st_size > 64_000:
+                    raise ProviderConfigurationError(
+                        "فایل Cloudflare credential بیش از حد بزرگ است."
+                    )
+                if file_stat.st_mode & 0o077:
+                    raise ProviderConfigurationError(
+                        "دسترسی cloudflare.env ناامن است؛ chmod 600 اجرا کنید."
+                    )
+                file_values = _parse_cloudflare_env(
+                    credential_path.read_text(encoding="utf-8")
+                )
+                values.update(file_values)
+            except ProviderConfigurationError:
+                raise
+            except (OSError, UnicodeError) as exc:
+                raise ProviderConfigurationError(
+                    "خواندن امن cloudflare.env ممکن نیست."
+                ) from exc
+
+        # Any explicitly supplied environment value overrides the file value.
+        for name, value in env_values.items():
+            if value:
+                values[name] = value
+
+    account_id = values.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
+    api_token = values.get("CLOUDFLARE_API_TOKEN", "").strip()
+    if not account_id and not api_token:
+        return {}
+    if not account_id or not api_token:
+        raise ProviderConfigurationError(
+            "هر دو متغیر Cloudflare باید تنظیم شوند."
+        )
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", account_id):
+        raise ProviderConfigurationError(
+            "CLOUDFLARE_ACCOUNT_ID باید یک شناسه معتبر ۳۲ کاراکتری باشد."
+        )
+
+    return {
+        "CLOUDFLARE_ACCOUNT_ID": account_id,
+        "CLOUDFLARE_API_TOKEN": api_token,
+    }
+
+
+def _cloudflare_provider():
+    credentials = load_cloudflare_credentials()
+    if not credentials:
+        return None
+    account_id = credentials["CLOUDFLARE_ACCOUNT_ID"]
+    return {
+        "id": "cloudflare",
+        "name": "Cloudflare Workers AI",
+        "model": CLOUDFLARE_MODEL,
+        "url": (
+            f"{CLOUDFLARE_API_ROOT}/{account_id}/ai/v1/chat/completions"
+        ),
+        "api_key": credentials["CLOUDFLARE_API_TOKEN"],
+    }
+
+
+def _gemini_provider():
+    """Build the fallback from the existing, backward-compatible config."""
+    cfg = load_config()
+    api_key = str(cfg.get("api_key", "")).strip()
+    if not api_key:
+        return None
+
+    base_url = str(cfg.get("base_url", "")).rstrip("/")
+    model = str(cfg.get("model", "")).strip()
+    if not base_url or not model:
+        raise ProviderConfigurationError(
+            "تنظیمات Gemini ناقص است؛ fox-ai config را اجرا کنید."
+        )
+    return {
+        "id": "gemini",
+        "name": "Gemini",
+        "model": model,
+        "url": base_url + "/chat/completions",
+        "api_key": api_key,
+    }
+
+
+def provider_chain():
+    """Return Cloudflare first and the existing Gemini config second."""
+    providers = []
+    notices = []
+
+    try:
+        cloudflare = _cloudflare_provider()
+        if cloudflare:
+            providers.append(cloudflare)
+        else:
+            notices.append("Cloudflare تنظیم نشده است")
+    except ProviderConfigurationError as exc:
+        notices.append(f"Cloudflare: {exc}")
+
+    try:
+        gemini = _gemini_provider()
+        if gemini:
+            providers.append(gemini)
+        else:
+            notices.append("Gemini تنظیم نشده است")
+    except ProviderConfigurationError as exc:
+        notices.append(f"Gemini: {exc}")
+
+    return providers, notices
+
+
+def _request_provider(provider, messages, temperature=0.1):
+    payload = {
+        "model": provider["model"],
+        "messages": messages,
+        "temperature": temperature,
+    }
+    request = urllib.request.Request(
+        provider["url"],
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + provider["api_key"],
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=180) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        # An HTTP failure is isolated to the primary provider; the same
+        # OpenAI-compatible request may still succeed with Gemini.
+        fallbackable = provider["id"] == "cloudflare"
+        raise ProviderRequestError(
+            provider["name"], f"HTTP {exc.code}", fallbackable=fallbackable
+        ) from None
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise ProviderRequestError(
+            provider["name"],
+            "خطای شبکه یا timeout",
+            fallbackable=(provider["id"] == "cloudflare"),
+        ) from None
+    except (UnicodeError, json.JSONDecodeError):
+        raise ProviderRequestError(
+            provider["name"],
+            "پاسخ JSON معتبر نبود",
+            fallbackable=(provider["id"] == "cloudflare"),
+        ) from None
+
+    try:
+        content = data["choices"][0]["message"]["content"]
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError
+    except (KeyError, IndexError, TypeError, ValueError):
+        raise ProviderRequestError(
+            provider["name"],
+            "ساختار پاسخ معتبر نبود",
+            fallbackable=(provider["id"] == "cloudflare"),
+        ) from None
+
+    return content.strip()
+
+
+def request_chat_completion(messages, temperature=0.1):
+    providers, notices = provider_chain()
+    if not providers:
+        detail = "؛ ".join(notices) if notices else "هیچ تنظیمی پیدا نشد"
+        raise NoProviderAvailableError(
+            "هیچ Provider قابل استفاده نیست. " + detail
+        )
+
+    failures = []
+    for index, provider in enumerate(providers):
+        try:
+            content = _request_provider(provider, messages, temperature)
+            return content, provider["name"]
+        except ProviderRequestError as exc:
+            failures.append(f"{exc.provider}: {exc.reason}")
+            has_fallback = index + 1 < len(providers)
+            if exc.fallbackable and has_fallback:
+                print(
+                    "⚠️ Cloudflare Workers AI در دسترس نیست؛ "
+                    "تلاش امن با Gemini..."
+                )
+                continue
+            break
+
+    detail = "؛ ".join(failures + notices)
+    raise NoProviderAvailableError(
+        "هیچ Provider نتوانست درخواست را انجام دهد. " + detail
+    )
+
+
+def provider_status():
+    providers, notices = provider_chain()
+    by_id = {provider["id"]: provider for provider in providers}
+    active = providers[0]["name"] if providers else "NONE"
+    return {
+        "active": active,
+        "cloudflare": (
+            f"configured ({CLOUDFLARE_MODEL})"
+            if "cloudflare" in by_id else "not configured"
+        ),
+        "gemini": (
+            "configured" if "gemini" in by_id else "not configured"
+        ),
+        "notices": notices,
+    }
+
+
+def extract_json_object(content):
+    content = content.strip()
+    if "```" in content:
+        blocks = re.findall(
+            r"```(?:json)?\s*(.*?)```", content, re.DOTALL | re.IGNORECASE
+        )
+        if blocks:
+            content = blocks[0].strip()
+    if not content.startswith("{"):
+        start = content.find("{")
+        end = content.rfind("}")
+        if start != -1 and end > start:
+            content = content[start:end + 1]
+    return json.loads(content)
 
 
 def project_root():
@@ -261,26 +594,7 @@ SYSTEM = r"""
 
 
 def ask_ai(user_request):
-    cfg = load_config()
-
-    api_key = cfg.get("api_key", "").strip()
-    base_url = cfg.get("base_url", "").rstrip("/")
-    model = cfg.get("model", "").strip()
-
-    if not api_key:
-        print("""
-❌ API Key تنظیم نشده.
-
-این دستور را بزن:
-
-fox-ai config
-
-بعد API Key را وارد کن.
-""")
-        return None
-
     context = project_context()
-
     prompt = f"""
 PROJECT ROOT:
 {ROOT}
@@ -293,61 +607,27 @@ USER REQUEST:
 
 حالا بهترین تغییرات لازم را به صورت JSON برگردان.
 """
-
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.1
-    }
-
-    url = base_url + "/chat/completions"
-
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": "Bearer " + api_key
-        },
-        method="POST"
-    )
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": prompt},
+    ]
 
     try:
-        with urllib.request.urlopen(req, timeout=180) as response:
-            data = json.loads(response.read().decode())
-
-        content = data["choices"][0]["message"]["content"].strip()
-
-        # استخراج JSON حتی اگر مدل قبل/بعدش توضیح داده باشد
-        import re
-
-        content = content.strip()
-
-        # markdown code fence
-        if "```" in content:
-            blocks = re.findall(r"```(?:json)?\\s*(.*?)```", content, re.DOTALL | re.IGNORECASE)
-            if blocks:
-                content = blocks[0].strip()
-
-        # پیدا کردن اولین object JSON
-        if not content.startswith("{"):
-            start = content.find("{")
-            end = content.rfind("}")
-            if start != -1 and end > start:
-                content = content[start:end + 1]
-
-        return json.loads(content)
-
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")
-        print(f"\n❌ API Error {e.code}\n{body}")
+        content, provider_name = request_chat_completion(messages)
+        result = extract_json_object(content)
+        if not isinstance(result, dict):
+            raise ValueError("AI response is not an object")
+        result["_provider"] = provider_name
+        return result
+    except NoProviderAvailableError as exc:
+        print(f"\n❌ {exc}")
+        print(
+            "Cloudflare: ~/.config/fox-ai/cloudflare.env | "
+            "Gemini fallback: fox-ai config"
+        )
         return None
-
-    except Exception as e:
-        print(f"\n❌ خطا در ارتباط با AI:\n{e}")
+    except (json.JSONDecodeError, ValueError) as exc:
+        print(f"\n❌ پاسخ Provider قابل پردازش نیست: {exc}")
         return None
 
 
@@ -355,7 +635,14 @@ def backup_file(path, timestamp):
     if not path.exists():
         return
 
-    dest = ROOT / BACKUP_DIR / timestamp / path.relative_to(ROOT)
+    relative = path.relative_to(ROOT)
+    reason = protected_path_reason(relative)
+    if reason:
+        raise Exception(
+            f"فایل محافظت‌شده هرگز backup نمی‌شود: {relative}"
+        )
+
+    dest = ROOT / BACKUP_DIR / timestamp / relative
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(path, dest)
 
@@ -392,6 +679,11 @@ def apply_actions(result):
 
         try:
             path = safe_path(rel)
+            reason = protected_path_reason(Path(rel))
+            if reason:
+                raise Exception(
+                    f"تغییر فایل محافظت‌شده توسط AI ممنوع است: {rel}"
+                )
         except Exception as e:
             print(f"❌ {e}")
             return False
@@ -544,48 +836,49 @@ def undo():
 
 
 def configure():
+    """Configure the existing Gemini fallback; Cloudflare stays env-only."""
     cfg = load_config()
 
-    print("\nFox AI Configuration\n")
+    print("\nFox AI Configuration")
+    print("Primary: Cloudflare Workers AI")
+    print(f"  credentials: {CLOUDFLARE_ENV_FILE}")
+    print("  required: CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN")
+    print("  security: chmod 600 ~/.config/fox-ai/cloudflare.env")
+    print("\nFallback: Gemini (existing config)\n")
 
-    base = input(
-        f"Base URL [{cfg.get('base_url')}]: "
-    ).strip()
-
+    base = input("Gemini Base URL [Enter = keep current]: ").strip()
     if base:
         cfg["base_url"] = base.rstrip("/")
 
-    key = input("API Key: ").strip()
-
+    key = getpass.getpass("Gemini API Key [Enter = keep current]: ").strip()
     if key:
         cfg["api_key"] = key
 
     model = input(
-        f"Model [{cfg.get('model')}]: "
+        f"Gemini Model [{cfg.get('model')}]: "
     ).strip()
-
     if model:
         cfg["model"] = model
 
     save_config(cfg)
-
-    print("\n✅ تنظیمات ذخیره شد.")
+    print("\n✅ تنظیمات Gemini fallback ذخیره شد.")
     print(CONFIG_FILE)
+    print("هیچ Cloudflare credential در config.json ذخیره نشد.")
 
 
 def status():
     print("\n🦊 Fox AI")
     print("Project:", ROOT)
+    print("Files:", len(collect_files()))
 
-    files = collect_files()
-
-    print("Files:", len(files))
-
-    cfg = load_config()
-
-    print("API:", "configured" if cfg.get("api_key") else "NOT configured")
-    print("Model:", cfg.get("model"))
-    print("Base:", cfg.get("base_url"))
+    state = provider_status()
+    print("Active Provider:", state["active"])
+    print("Cloudflare:", state["cloudflare"])
+    print("Gemini fallback:", state["gemini"])
+    for notice in state["notices"]:
+        # Notices contain configuration state only, never credential values.
+        if "ناقص" in notice or "نامعتبر" in notice or "ناامن" in notice:
+            print("Provider warning:", notice)
 
 
 def run_request(req):
@@ -598,6 +891,9 @@ def run_request(req):
     if not result:
         return
 
+    provider_name = result.pop("_provider", None)
+    if provider_name:
+        print(f"\n🔌 Provider: {provider_name}")
     print("\n🤖", result.get("summary", "No summary"))
 
     apply_actions(result)
@@ -666,16 +962,6 @@ def chat():
         history.append({"role": "user", "content": user})
 
         context = project_context()
-
-        cfg = load_config()
-        api_key = cfg.get("api_key", "").strip()
-        base_url = cfg.get("base_url", "").rstrip("/")
-        model = cfg.get("model", "").strip()
-
-        if not api_key:
-            print("❌ API Key تنظیم نشده. بزن: fox-ai config")
-            continue
-
         chat_system = SYSTEM + r"""
 
 این یک گفت‌وگوی چندمرحله‌ای است.
@@ -684,13 +970,10 @@ def chat():
 اگر کاربر گفت تست کن، تست مناسب پیشنهاد بده.
 اگر درخواست فقط توضیح بود، actions را خالی بگذار.
 """
-
         messages = [{"role": "system", "content": chat_system}]
 
         # حفظ چند پیام اخیر برای جلوگیری از بزرگ شدن بیش از حد context
-        for item in history[-10:]:
-            messages.append(item)
-
+        messages.extend(history[-10:])
         messages.append({
             "role": "user",
             "content": f"""
@@ -702,75 +985,31 @@ CURRENT PROJECT FILES:
 
 CURRENT REQUEST:
 {user}
-"""
+""",
         })
-
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": 0.1
-        }
-
-        url = base_url + "/chat/completions"
-
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode(),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": "Bearer " + api_key
-            },
-            method="POST"
-        )
 
         try:
             print("\n🧠 در حال فکر کردن...")
-
-            with urllib.request.urlopen(req, timeout=180) as response:
-                data = json.loads(response.read().decode())
-
-            content = data["choices"][0]["message"]["content"].strip()
-
+            content, provider_name = request_chat_completion(messages)
+            print(f"\n🔌 Provider: {provider_name}")
             print("\n🤖", content)
 
-            # اگر پاسخ شامل actionهای JSON باشد
             try:
-                clean = content
-
-                if "```" in clean:
-                    blocks = re.findall(
-                        r"```(?:json)?\s*(.*?)```",
-                        clean,
-                        re.DOTALL | re.IGNORECASE
-                    )
-                    if blocks:
-                        clean = blocks[0].strip()
-
-                if not clean.startswith("{"):
-                    start = clean.find("{")
-                    end = clean.rfind("}")
-                    if start != -1 and end > start:
-                        clean = clean[start:end + 1]
-
-                result = json.loads(clean)
-
+                result = extract_json_object(content)
                 if isinstance(result, dict) and "actions" in result:
                     print("\n" + "=" * 60)
                     print("تغییرات پیشنهادی")
                     print("=" * 60)
-
                     apply_actions(result)
-
-            except Exception:
+            except (json.JSONDecodeError, ValueError, TypeError):
                 # پاسخ معمولی بوده و action قابل اجرا ندارد
                 pass
-
-        except urllib.error.HTTPError as e:
-            body = e.read().decode(errors="replace")
-            print(f"\n❌ API Error {e.code}\n{body}")
-
-        except Exception as e:
-            print(f"\n❌ خطا در ارتباط با AI:\n{e}")
+        except NoProviderAvailableError as exc:
+            print(f"\n❌ {exc}")
+            print(
+                "Cloudflare: ~/.config/fox-ai/cloudflare.env | "
+                "Gemini fallback: fox-ai config"
+            )
 
 
 
@@ -1116,21 +1355,25 @@ _SECRET_PATTERNS = (
 )
 _SECRET_ASSIGNMENT = re.compile(
     r'''(?ix)
-    ["']?(api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|
-    password|passwd|private[_-]?key|credentials?)["']?
+    ["']?(?:[a-z0-9]+[_-])*
+    (api[_-]?(?:key|token)|access[_-]?token|auth[_-]?token|
+    client[_-]?secret|account[_-]?id|password|passwd|private[_-]?key|
+    credentials?)["']?
     \s*[:=]\s*["']([^"'\r\n]{8,})["']
     '''
 )
 _SECRET_UNQUOTED_ASSIGNMENT = re.compile(
     r'''(?imx)^
-    \s*["']?(api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|
-    password|passwd|private[_-]?key|credentials?)["']?
+    \s*["']?(?:[a-z0-9]+[_-])*
+    (api[_-]?(?:key|token)|access[_-]?token|auth[_-]?token|
+    client[_-]?secret|account[_-]?id|password|passwd|private[_-]?key|
+    credentials?)["']?
     \s*[:=]\s*([A-Za-z0-9_./+@:=~-]{8,})\s*(?:[#;].*)?$
     '''
 )
 _PLACEHOLDER_WORDS = (
     "example", "sample", "placeholder", "your_", "your-", "changeme",
-    "change_me", "dummy", "not-a-real", "redacted", "<", "${", "$",
+    "change_me", "dummy", "not-a-real", "redacted", "<", "${", "{", "$",
 )
 
 
@@ -1563,6 +1806,10 @@ def main():
   fox-ai config
   fox-ai status
   fox-ai undo
+
+Providerها:
+  Cloudflare Workers AI (اصلی): ~/.config/fox-ai/cloudflare.env
+  Gemini (fallback): fox-ai config
 
 Git واقعی:
   fox-ai git status
